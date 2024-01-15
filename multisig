@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.6.2;
+
+contract MultiSigWallet {
+
+    event Confirmation(address indexed sender, bytes32 indexed transactionHash);
+    event Revocation(address indexed sender, bytes32 indexed transactionHash);
+    event Submission(bytes32 indexed transactionHash);
+    event Execution(bytes32 indexed transactionHash);
+    event Deposit(address indexed sender, uint256 value);
+    event OwnerAddition(address indexed owner);
+    event OwnerRemoval(address indexed owner);
+    event RequiredUpdate(uint256 required);
+
+    mapping (bytes32 => Transaction) public transactions;
+    mapping (bytes32 => mapping (address => bool)) public confirmations;
+    mapping (address => bool) public isOwner;
+    address[] public owners;
+    bytes32[] public transactionList;
+    uint256 public required;
+
+    struct Transaction {
+        address destination;
+        uint256 value;
+        bytes data;
+        uint256 nonce;
+        bool executed;
+    }
+
+    modifier onlyWallet() {
+        require(msg.sender == address(this), "Caller is not the wallet");
+        _;
+    }
+
+    modifier signaturesFromOwners(bytes32 transactionHash, uint8[] memory v, bytes32[] memory rs) {
+        for (uint256 i = 0; i < v.length; i++) {
+            require(isOwner[ecrecover(transactionHash, v[i], rs[i], rs[v.length + i])], "Invalid owner signature");
+        }
+        _;
+    }
+
+    modifier ownerDoesNotExist(address owner) {
+        require(!isOwner[owner], "Owner already exists");
+        _;
+    }
+
+    modifier ownerExists(address owner) {
+        require(isOwner[owner], "Owner does not exist");
+        _;
+    }
+
+    modifier confirmed(bytes32 transactionHash, address owner) {
+        require(confirmations[transactionHash][owner], "Transaction not confirmed by owner");
+        _;
+    }
+
+    modifier notConfirmed(bytes32 transactionHash, address owner) {
+        require(!confirmations[transactionHash][owner], "Transaction already confirmed by owner");
+        _;
+    }
+
+    modifier notExecuted(bytes32 transactionHash) {
+        require(!transactions[transactionHash].executed, "Transaction already executed");
+        _;
+    }
+
+    modifier notNull(address destination) {
+        require(destination != address(0), "Invalid destination address");
+        _;
+    }
+
+    modifier validRequired(uint256 _ownerCount, uint256 _required) {
+        require(_required > 0 && _required <= _ownerCount && _ownerCount > 0, "Invalid required value");
+        _;
+    }
+
+    function addOwner(address owner)
+        external
+        onlyWallet
+        ownerDoesNotExist(owner)
+    {
+        isOwner[owner] = true;
+        owners.push(owner);
+        emit OwnerAddition(owner);
+    }
+
+    function removeOwner(address owner)
+        external
+        onlyWallet
+        ownerExists(owner)
+    {
+        isOwner[owner] = false;
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (owners[i] == owner) {
+                owners[i] = owners[owners.length - 1];
+                break;
+            }
+        }
+        owners.pop();
+        if (required > owners.length) {
+            updateRequired(owners.length);
+        }
+        emit OwnerRemoval(owner);
+    }
+
+    function updateRequired(uint256 _required)
+        public
+        onlyWallet
+        validRequired(owners.length, _required)
+    {
+        required = _required;
+        emit RequiredUpdate(_required);
+    }
+	
+	constructor(address[] memory _owners, uint256 _required) public
+    validRequired(_owners.length, _required)
+{
+    for (uint i = 0; i < _owners.length; i++)
+        isOwner[_owners[i]] = true;
+    owners = _owners;
+    required = _required;
+}
+
+
+    function addTransaction(address destination, uint256 value, bytes memory data, uint256 nonce)
+        private
+        notNull(destination)
+        returns (bytes32 transactionHash)
+    {
+        transactionHash = keccak256(abi.encodePacked(destination, value, data, nonce));
+        if (transactions[transactionHash].destination == address(0)) {
+            transactions[transactionHash] = Transaction({
+                destination: destination,
+                value: value,
+                data: data,
+                nonce: nonce,
+                executed: false
+            });
+            transactionList.push(transactionHash);
+            emit Submission(transactionHash);
+        }
+    }
+
+    function submitTransaction(
+    address destination,
+    uint256 value,
+    bytes calldata data,  // Specify data location as calldata
+    uint256 nonce
+)
+    external
+    returns (bytes32 transactionHash)
+{
+    transactionHash = addTransaction(destination, value, data, nonce);
+    confirmTransaction(transactionHash);
+}
+
+
+    function submitTransactionWithSignatures(
+    address destination,
+    uint256 value,
+    bytes calldata data,  // Specify data location as calldata
+    uint256 nonce,
+    uint8[] calldata v,
+    bytes32[] calldata rs
+)
+    external
+    returns (bytes32 transactionHash)
+{
+    transactionHash = addTransaction(destination, value, data, nonce);
+    confirmTransactionWithSignatures(transactionHash, v, rs);
+}
+
+
+    function addConfirmation(bytes32 transactionHash, address owner)
+        private
+        notConfirmed(transactionHash, owner)
+    {
+        confirmations[transactionHash][owner] = true;
+        emit Confirmation(owner, transactionHash);
+    }
+
+    function confirmTransaction(bytes32 transactionHash)
+        public
+        ownerExists(msg.sender)
+    {
+        addConfirmation(transactionHash, msg.sender);
+        executeTransaction(transactionHash);
+    }
+
+    function confirmTransactionWithSignatures(bytes32 transactionHash, uint8[] memory v, bytes32[] memory rs)
+        public
+        signaturesFromOwners(transactionHash, v, rs)
+    {
+        for (uint256 i = 0; i < v.length; i++) {
+            addConfirmation(transactionHash, ecrecover(transactionHash, v[i], rs[i], rs[i + v.length]));
+        }
+        executeTransaction(transactionHash);
+    }
+
+    function executeTransaction(bytes32 transactionHash)
+        public
+        notExecuted(transactionHash)
+    {
+        if (isConfirmed(transactionHash)) {
+            Transaction storage tx = transactions[transactionHash];
+            tx.executed = true;
+            (bool success, ) = tx.destination.call{value: tx.value}(tx.data);
+            require(success, "Transaction execution failed");
+            emit Execution(transactionHash);
+        }
+    }
+
+    function revokeConfirmation(bytes32 transactionHash)
+        external
+        ownerExists(msg.sender)
+        confirmed(transactionHash, msg.sender)
+        notExecuted(transactionHash)
+    {
+        confirmations[transactionHash][msg.sender] = false;
+        emit Revocation(msg.sender, transactionHash);
+    }
+
+    function isConfirmed(bytes32 transactionHash)
+        public
+        view
+        returns (bool)
+    {
+        uint256 count = 0;
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (confirmations[transactionHash][owners[i]]) {
+                count += 1;
+            }
+            if (count == required) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function confirmationCount(bytes32 transactionHash)
+        external
+        view
+        returns (uint256 count)
+    {
+        for (uint256 i = 0; i < owners.length; i++) {
+            if (confirmations[transactionHash][owners[i]]) {
+                count += 1;
+            }
+        }
+    }
+
+    function filterTransactions(bool isPending)
+        private
+        view
+        returns (bytes32[] memory _transactionList)
+    {
+        bytes32[] memory _transactionListTemp = new bytes32[](transactionList.length);
+        uint256 count = 0;
+        for (uint256 i = 0; i < transactionList.length; i++) {
+            if ((isPending && !transactions[transactionList[i]].executed) ||
+                (!isPending && transactions[transactionList[i]].executed)) {
+                _transactionListTemp[count] = transactionList[i];
+                count += 1;
+            }
+        }
+        _transactionList = new bytes32[](count);
+        for (uint256 i = 0; i < count; i++) {
+            if (_transactionListTemp[i] > 0) {
+                _transactionList[i] = _transactionListTemp[i];
+            }
+        }
+    }
+
+    function getPendingTransactions()
+        external
+        view
+        returns (bytes32[] memory _transactionList)
+    {
+        return filterTransactions(true);
+    }
+
+    function getExecutedTransactions()
+        external
+        view
+        returns (bytes32[] memory _transactionList)
+    {
+        return filterTransactions(false);
+    }
+
+    receive() external payable {
+        if (msg.value > 0) {
+            emit Deposit(msg.sender, msg.value);
+        }
+    }
+}
